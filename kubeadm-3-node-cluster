@@ -1,0 +1,122 @@
+Steps to create a Kubernetes 3 Node Cluster ( 1 Master, 2 Worker ) 
+---
+
+1) Provision 3 VMs in Azure or AWS ( atleast 4 core / 2GB Ram for Master and 2/1 for Workers ). 
+   Allow SSH on all to just your IP.
+   
+2) Switch to root User : 
+     $ sudo -i
+
+3) We will use containerd as the container runtime in our Kubernetes cluster. 
+In Kubernetes version 1.20 Docker was deprecated as a container runtime in a Kubernetes cluster and support was removed in 1.22. 
+Kubernetes 1.26 now requires that you use a runtime that conforms with the Container Runtime Interface (CRI). containerd is a CRI-compatible container runtime and is one of the supported options.
+You can use container imaged created with Docker in containerd. containerd is going to start and run the container in your Kubernetes cluster.
+
+I will also cover setting the cgroup driver for containerd to systemd, which is the preferred cgroup driver for Kubernetes.
+
+  a) First, load two modules in the current running environment and configure them to load on boot
+    cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+    overlay
+    br_netfilter
+    EOF
+
+  b) Load at runtime:
+  sudo modprobe overlay
+  sudo modprobe br_netfilter
+  
+4) Update Iptables Firewall Settings:
+  To ensure packets are properly processed by IP tables during filtering and port forwarding. Set the net.bridge.bridge-nf-call-iptables to ‘1’ in your sysctl config file.
+  Configure required sysctl to persist across system reboots
+    $ cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+    
+    Apply sysctl parameters without rebooting to current running environment
+    $ sudo sysctl --system
+    
+ 5) Install containerd packages
+ 
+    a) Add Docker Repo
+    The containerd package included in the default Ubuntu repositories stops at 1.5.9. To bootstrap a cluster on a modern version of Kubernetes, you will need container 1.6+. To get 1.6+ you’ll need to get the containerd package from the docker repository.
+       $ curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+       $ add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+    
+    b) Install containerd
+       $ apt update
+       $ apt install -y containerd.io
+    
+    c) Configure containerd and start as service:
+       $ mkdir -p /etc/containerd
+       $ sudo containerd config default | sudo tee /etc/containerd/config.toml
+
+       $ systemctl restart containerd
+       $ systemctl enable containerd
+       $ systemctl status containerd 
+    
+ 6) Install Kubelet, Kubeadm, kubectl on all hosts.
+ 
+    a) Update the apt package index and install packages needed to use the Kubernetes apt repository:
+     $ apt-get update && apt-get install -y apt-transport-https ca-certificates curl
+     
+    b) Download the Google Cloud public signing key:
+     $ curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+     
+    c) Add the Kubernetes apt repository:
+     $ echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+    
+    d) Update apt package index, install kubelet, kubeadm and kubectl, and pin their version:
+      $ KUBE_VERSION=1.24.13
+      $ apt-get update
+
+      $ apt-get install -y kubelet=${KUBE_VERSION}-00 kubeadm=${KUBE_VERSION}-00 kubectl=${KUBE_VERSION}-00 kubernetes-cni=1.2.0-00
+
+    e) To hold the installed packages at their installed versions, use the following command:
+     $ apt-mark hold kubelet kubeadm kubectl
+ 
+    f) Start the kubelet service is required on all the nodes:
+    $ systemctl enable kubelet && systemctl start kubelet
+    
+ 7) Create A Kubernetes Cluster ( Initialize on Master Node )
+      As we have successfully installed Kubeadm, next we will create a Kubernetes cluster using the following mentioned steps:
+  
+   a) We have to initialize kubeadm on the master node. This command will check against the node that we have all the required dependencies. If it is passed, then it will install control plane components.
+      (Note: Run this command in Master Node only.)
+      $ kubeadm init --kubernetes-version=${KUBE_VERSION}
+      
+      If cluster initialization has succeeded, then we will see a cluster join command. 
+      This command will be used by the worker nodes to join the Kubernetes cluster, so copy this command and save it for the future use.
+  
+    b) Step 2) To start using the cluster, we have to set the environment variable on the master node.
+To temporarily set the environment variables on the master node, run the following commands:
+
+(Note: Every time you are starting the Master, you have to set these Environment Variables.)
+    $ cp /etc/kubernetes/admin.conf $HOME/
+    $ chown  $(id -u) $HOME/admin.conf
+    $ export KUBECONFIG=$HOME/admin.conf
+    
+  8) Join Worker Nodes to the Kubernetes Cluster
+  Take the output in the format of below and run on worker nodes. 
+     kubeadm join XX.XX.XX.XX:6443 --token adsde.sdfdsfdsfdsfewsr \
+        --discovery-token-ca-cert-hash sha256:374c518dsfd099326chgdfg91c6sdfsdfsdfewr17e2e10fdghbbca5a0e4
+(Note: Don’t use this same command, use the command that you have received and saved while doing kubeadm init command.)
+( if you missed saving it - generate new token again kubeadm token create --print-join-command ) 
+Using Kubectl get nodes command, we can see the status of our Nodes (master and worker) whether they are ready or not.
+You should see them as 'NotReady'
+
+9) Install CNI Plugins 
+	We have to install CNI so that pods can communicate across nodes and also Cluster DNS to start functioning. 
+  Apply Weave CNI (Container Network Interface) on the master node.
+    $ kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml
+  To verify the status of the system pods like coreDNS, weave-net, Kube-proxy, and all other master node system processes, use the following command:
+   $ kubectl get pods -n kube-system 
+
+10) Test the New Kubernetes Cluster
+   $ kubectl get nodes
+   You should see them as Ready now.
+   $ kubectl create deployment sb-flask-py-deploy --image=sankeerthboddu/python-flask:latest
+   $ kubectl get rs
+   $ kubectl get pods ( should see in default ns )
+   $ Next create Service ( NodeIP ) and access the site ( also allow in Cloud )
+
